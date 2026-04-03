@@ -82,14 +82,16 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        self.update_step = 0
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, return_predicted_ids=False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            predicted_ids: # (bs, response_len) int64 argmax token IDs, or None
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -203,6 +205,13 @@ class DataParallelPPOActor(BasePPOActor):
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
 
+                # extract argmax predicted token IDs if requested (for RWML)
+                predicted_ids_rmpad = None
+                if return_predicted_ids and not self.use_fused_kernels:
+                    # logits_rmpad is (total_nnz, vocab_size) before temperature division
+                    # We need argmax BEFORE logits are consumed
+                    predicted_ids_rmpad = logits_rmpad.argmax(dim=-1)  # (total_nnz,)
+
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
@@ -215,6 +224,13 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_entropy:
                         entropy_rmpad = gather_outputs_and_unpad(
                             entropy_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
+                    if predicted_ids_rmpad is not None:
+                        predicted_ids_rmpad = gather_outputs_and_unpad(
+                            predicted_ids_rmpad,
                             gather_dim=0,
                             unpad_dim=0,
                             padding_size=pad_size,
@@ -233,11 +249,20 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if predicted_ids_rmpad is not None:
+                    full_predicted_ids = pad_input(
+                        hidden_states=predicted_ids_rmpad.unsqueeze(-1).float(),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
 
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if predicted_ids_rmpad is not None:
+                    predicted_ids_out = full_predicted_ids.squeeze(-1)[:, -response_length - 1 : -1].long()  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -261,6 +286,10 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits = output.logits
 
+                    # Extract argmax predicted IDs before temperature scaling
+                    if return_predicted_ids:
+                        predicted_ids_out = logits[:, -response_length - 1 : -1, :].argmax(dim=-1)  # (bsz, response_length)
+
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
@@ -270,7 +299,13 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            # Assemble predicted_ids return value
+            if not return_predicted_ids:
+                predicted_ids_out = None
+            elif "predicted_ids_out" not in locals():
+                predicted_ids_out = None
+
+            return entropy, log_probs, predicted_ids_out
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -294,7 +329,7 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False, return_predicted_ids=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -309,8 +344,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+            return_predicted_ids: If True, also return argmax predicted token IDs (for RWML).
+
         Returns:
-            torch.Tensor: the log_prob tensor
+            (log_probs, entropys, predicted_ids_or_None)
         """
         # set to eval
         self.actor_module.eval()
@@ -332,28 +369,38 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        predicted_ids_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, predicted_ids = self._forward_micro_batch(
+                    model_inputs, temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    return_predicted_ids=return_predicted_ids,
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if return_predicted_ids and predicted_ids is not None:
+                predicted_ids_lst.append(predicted_ids)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        all_predicted_ids = None
+        if return_predicted_ids and predicted_ids_lst:
+            all_predicted_ids = torch.concat(predicted_ids_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if all_predicted_ids is not None:
+                all_predicted_ids = restore_dynamic_batch(all_predicted_ids, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, all_predicted_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -377,6 +424,10 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "observation_mask" in data.batch.keys():
+            select_keys.append("observation_mask")
+        if "sft_weights" in data.batch.keys():
+            select_keys.append("sft_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -423,8 +474,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    entropy, log_prob, _ = self._forward_micro_batch(
+                        model_inputs, temperature=temperature,
+                        calculate_entropy=calculate_entropy,
                     )
 
                     # for fully_async_policy recipe
@@ -483,6 +535,34 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    # World model SFT loss on observation tokens
+                    wm_coeff = getattr(self.config, "world_model_coeff", 0.0)
+                    if wm_coeff > 0:
+                        annealing_steps = getattr(self.config, "world_model_annealing_steps", 0)
+                        if annealing_steps > 0:
+                            annealing_end_factor = getattr(self.config, "world_model_annealing_end_factor", 1.0)
+                            progress = min(1.0, self.update_step / annealing_steps)
+                            annealing_factor = 1.0 - (1.0 - annealing_end_factor) * progress
+                            wm_coeff *= annealing_factor
+
+                    obs_mask = model_inputs.get("observation_mask", None)
+                    if wm_coeff > 0 and obs_mask is not None:
+                        obs_mask = obs_mask.to(bool)
+                        if obs_mask.sum() > 0:
+                            sft_weights = model_inputs.get("sft_weights", None)
+                            if sft_weights is not None:
+                                sft_weights = sft_weights[obs_mask]
+                                log_prob_obs = log_prob[obs_mask]
+                                wm_loss = -(log_prob_obs * sft_weights).sum() / (sft_weights.sum() + 1e-8)
+                            else:
+                                from verl.utils.torch_functional import masked_mean
+                                wm_loss = -masked_mean(log_prob, obs_mask)
+                                
+                            policy_loss = policy_loss + wm_coeff * wm_loss
+                            micro_batch_metrics["actor/wm_sft_loss"] = wm_loss.detach().item()
+                            micro_batch_metrics["actor/wm_coeff"] = wm_coeff
+                            micro_batch_metrics["actor/wm_num_obs_tokens"] = obs_mask.sum().item()
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
@@ -504,4 +584,5 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        self.update_step += 1
         return metrics

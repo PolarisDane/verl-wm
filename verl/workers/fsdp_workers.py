@@ -973,11 +973,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
+        rwml_enabled = data.meta_info.get("rwml_enabled", False)
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, predicted_ids = self.actor.compute_log_prob(
+                    data=data, calculate_entropy=True, return_predicted_ids=rwml_enabled
+                )
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            if predicted_ids is not None:
+                tensors["predicted_ids"] = predicted_ids
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 

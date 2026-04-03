@@ -120,6 +120,10 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    # World model SFT loss: predict environment observation tokens as auxiliary task
+    world_model_coeff: float = 0.0
+    world_model_annealing_steps: int = 0
+    world_model_annealing_end_factor: float = 1.0
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
