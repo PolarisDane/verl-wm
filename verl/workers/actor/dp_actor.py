@@ -184,6 +184,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+
+                    # Extract argmax predicted token IDs BEFORE any in-place modifications (for RWML)
+                    predicted_ids_rmpad = None
+                    if return_predicted_ids:
+                        predicted_ids_rmpad = logits_rmpad.argmax(dim=-1)  # (total_nnz,)
+
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -204,13 +210,6 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
                                 self.compute_entropy_from_logits, logits_rmpad
                             )
-
-                # extract argmax predicted token IDs if requested (for RWML)
-                predicted_ids_rmpad = None
-                if return_predicted_ids and not self.use_fused_kernels:
-                    # logits_rmpad is (total_nnz, vocab_size) before temperature division
-                    # We need argmax BEFORE logits are consumed
-                    predicted_ids_rmpad = logits_rmpad.argmax(dim=-1)  # (total_nnz,)
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
