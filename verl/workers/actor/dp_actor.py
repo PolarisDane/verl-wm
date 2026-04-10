@@ -433,6 +433,8 @@ class DataParallelPPOActor(BasePPOActor):
         device = get_device_id()
 
         # FSDP context for generation (see hf_rollout.py:108-110)
+        # summon_full_params returns a generator context manager that can only
+        # be entered once, so it must wrap the entire micro-batch loop.
         if isinstance(self.actor_module, FSDP):
             param_ctx = FSDP.summon_full_params(
                 self.actor_module, writeback=False, recurse=False
@@ -442,45 +444,46 @@ class DataParallelPPOActor(BasePPOActor):
 
         all_generated: list = []
 
-        for mb_start in range(0, len(prefix_ids_list), micro_batch_size):
-            mb_end = min(mb_start + micro_batch_size, len(prefix_ids_list))
-            mb_prefixes = prefix_ids_list[mb_start:mb_end]
+        with param_ctx:
+            for mb_start in range(0, len(prefix_ids_list), micro_batch_size):
+                mb_end = min(mb_start + micro_batch_size, len(prefix_ids_list))
+                mb_prefixes = prefix_ids_list[mb_start:mb_end]
 
-            # Left-pad to longest prefix in this micro-batch
-            max_len = max(len(p) for p in mb_prefixes)
-            padded = torch.full(
-                (len(mb_prefixes), max_len), pad_token_id,
-                dtype=torch.long, device=device,
-            )
-            attn_mask = torch.zeros(
-                (len(mb_prefixes), max_len), dtype=torch.long, device=device,
-            )
-            for j, prefix in enumerate(mb_prefixes):
-                seq_len = len(prefix)
-                padded[j, max_len - seq_len:] = torch.tensor(
-                    prefix, dtype=torch.long, device=device,
+                # Left-pad to longest prefix in this micro-batch
+                max_len = max(len(p) for p in mb_prefixes)
+                padded = torch.full(
+                    (len(mb_prefixes), max_len), pad_token_id,
+                    dtype=torch.long, device=device,
                 )
-                attn_mask[j, max_len - seq_len:] = 1
-
-            with param_ctx, torch.autocast(
-                device_type=get_device_name(), dtype=torch.bfloat16
-            ):
-                output = self.actor_module.generate(
-                    input_ids=padded,
-                    attention_mask=attn_mask,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=pad_token_id,
-                    use_cache=True,
+                attn_mask = torch.zeros(
+                    (len(mb_prefixes), max_len), dtype=torch.long, device=device,
                 )
+                for j, prefix in enumerate(mb_prefixes):
+                    seq_len = len(prefix)
+                    padded[j, max_len - seq_len:] = torch.tensor(
+                        prefix, dtype=torch.long, device=device,
+                    )
+                    attn_mask[j, max_len - seq_len:] = 1
 
-            # Extract only the generated portion (everything after the prefix)
-            for j in range(len(mb_prefixes)):
-                gen_ids = output[j, max_len:].cpu().tolist()
-                # Trim trailing pad tokens
-                while gen_ids and gen_ids[-1] == pad_token_id:
-                    gen_ids.pop()
-                all_generated.append(gen_ids)
+                with torch.autocast(
+                    device_type=get_device_name(), dtype=torch.bfloat16
+                ):
+                    output = self.actor_module.generate(
+                        input_ids=padded,
+                        attention_mask=attn_mask,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=pad_token_id,
+                        use_cache=True,
+                    )
+
+                # Extract only the generated portion (everything after the prefix)
+                for j in range(len(mb_prefixes)):
+                    gen_ids = output[j, max_len:].cpu().tolist()
+                    # Trim trailing pad tokens
+                    while gen_ids and gen_ids[-1] == pad_token_id:
+                        gen_ids.pop()
+                    all_generated.append(gen_ids)
 
         return DataProto.from_dict(
             non_tensor_batch={
