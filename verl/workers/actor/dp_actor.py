@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -400,6 +401,92 @@ class DataParallelPPOActor(BasePPOActor):
                 all_predicted_ids = restore_dynamic_batch(all_predicted_ids, batch_idx_list)
 
         return log_probs, entropys, all_predicted_ids
+
+    @torch.no_grad()
+    def predict_observations(self, data: DataProto) -> DataProto:
+        """Generate predicted observations autoregressively for RWML.
+
+        For each prefix in ``data.non_tensor_batch["rwml_prefix_ids"]``,
+        runs greedy autoregressive generation using ``model.generate()``
+        and returns the generated token IDs.
+
+        Args:
+            data: DataProto with non_tensor_batch keys:
+                rwml_prefix_ids: numpy object array of token-ID lists
+                  (variable-length prefixes, one per prediction request).
+              and meta_info keys:
+                rwml_max_new_tokens, pad_token_id, rwml_stop_token_ids,
+                rwml_micro_batch_size.
+
+        Returns:
+            DataProto with non_tensor_batch["rwml_generated_ids"]: numpy
+            object array of generated token-ID lists.
+        """
+        import contextlib
+
+        self.actor_module.eval()
+
+        prefix_ids_list = data.non_tensor_batch["rwml_prefix_ids"]
+        max_new_tokens = int(data.meta_info.get("rwml_max_new_tokens", 256))
+        pad_token_id = int(data.meta_info["pad_token_id"])
+        micro_batch_size = int(data.meta_info.get("rwml_micro_batch_size", 16))
+        device = get_device_id()
+
+        # FSDP context for generation (see hf_rollout.py:108-110)
+        if isinstance(self.actor_module, FSDP):
+            param_ctx = FSDP.summon_full_params(
+                self.actor_module, writeback=False, recurse=False
+            )
+        else:
+            param_ctx = contextlib.nullcontext()
+
+        all_generated: list = []
+
+        for mb_start in range(0, len(prefix_ids_list), micro_batch_size):
+            mb_end = min(mb_start + micro_batch_size, len(prefix_ids_list))
+            mb_prefixes = prefix_ids_list[mb_start:mb_end]
+
+            # Left-pad to longest prefix in this micro-batch
+            max_len = max(len(p) for p in mb_prefixes)
+            padded = torch.full(
+                (len(mb_prefixes), max_len), pad_token_id,
+                dtype=torch.long, device=device,
+            )
+            attn_mask = torch.zeros(
+                (len(mb_prefixes), max_len), dtype=torch.long, device=device,
+            )
+            for j, prefix in enumerate(mb_prefixes):
+                seq_len = len(prefix)
+                padded[j, max_len - seq_len:] = torch.tensor(
+                    prefix, dtype=torch.long, device=device,
+                )
+                attn_mask[j, max_len - seq_len:] = 1
+
+            with param_ctx, torch.autocast(
+                device_type=get_device_name(), dtype=torch.bfloat16
+            ):
+                output = self.actor_module.generate(
+                    input_ids=padded,
+                    attention_mask=attn_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                    use_cache=True,
+                )
+
+            # Extract only the generated portion (everything after the prefix)
+            for j in range(len(mb_prefixes)):
+                gen_ids = output[j, max_len:].cpu().tolist()
+                # Trim trailing pad tokens
+                while gen_ids and gen_ids[-1] == pad_token_id:
+                    gen_ids.pop()
+                all_generated.append(gen_ids)
+
+        return DataProto.from_dict(
+            non_tensor_batch={
+                "rwml_generated_ids": np.array(all_generated, dtype=object),
+            },
+        )
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):

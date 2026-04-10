@@ -1001,6 +1001,58 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="magenta", role="actor_predict_observations")
+    def predict_observations(self, data: DataProto):
+        """Generate predicted observations autoregressively for RWML.
+
+        Builds RWML prediction prefixes using the tokenizer available here,
+        delegates generation to dp_actor, and decodes the generated tokens
+        back to text.
+        """
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from opentinker.backend_patch.verl.trainer.ppo.world_model_rl import (
+            build_rwml_prefixes,
+            decode_rwml_generations,
+        )
+
+        # Build prefixes (tokenization uses self.tokenizer)
+        prefix_data = build_rwml_prefixes(
+            input_ids=data.batch["input_ids"],
+            response_mask=data.batch["response_mask"],
+            attention_mask=data.batch["attention_mask"],
+            tokenizer=self.tokenizer,
+            prompt_template=data.meta_info.get("rwml_prompt_template", "direct"),
+        )
+        data.non_tensor_batch.update(prefix_data)
+        data.meta_info["pad_token_id"] = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+
+        # Generate observations via dp_actor
+        output = self.actor.predict_observations(data=data)
+
+        # Decode generated token IDs to text and extract <next_state> content
+        gen_texts = decode_rwml_generations(
+            output.non_tensor_batch["rwml_generated_ids"],
+            self.tokenizer,
+        )
+        output.non_tensor_batch["rwml_predicted_texts"] = gen_texts
+        output.non_tensor_batch["rwml_sample_indices"] = prefix_data["rwml_sample_indices"]
+        output.non_tensor_batch["rwml_turn_indices"] = prefix_data["rwml_turn_indices"]
+
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+        get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
