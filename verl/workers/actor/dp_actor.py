@@ -423,14 +423,26 @@ class DataParallelPPOActor(BasePPOActor):
             object array of generated token-ID lists.
         """
         import contextlib
+        import gc
 
         self.actor_module.eval()
 
         prefix_ids_list = data.non_tensor_batch["rwml_prefix_ids"]
-        max_new_tokens = int(data.meta_info.get("rwml_max_new_tokens", 256))
+        max_new_tokens = int(data.meta_info.get("rwml_max_new_tokens", 128))
         pad_token_id = int(data.meta_info["pad_token_id"])
-        micro_batch_size = int(data.meta_info.get("rwml_micro_batch_size", 16))
+        micro_batch_size = int(data.meta_info.get("rwml_micro_batch_size", 4))
+        max_prefix_len = int(data.meta_info.get("rwml_max_prefix_len", 2048))
         device = get_device_id()
+
+        # Truncate extremely long prefixes (left-truncate, keep most recent context)
+        truncated_prefixes = [
+            p[-max_prefix_len:] if len(p) > max_prefix_len else list(p)
+            for p in prefix_ids_list
+        ]
+
+        # Free any cached GPU memory before generating
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # FSDP context for generation (see hf_rollout.py:108-110)
         # summon_full_params returns a generator context manager that can only
@@ -444,52 +456,67 @@ class DataParallelPPOActor(BasePPOActor):
 
         all_generated: list = []
 
-        with param_ctx:
-            for mb_start in range(0, len(prefix_ids_list), micro_batch_size):
-                mb_end = min(mb_start + micro_batch_size, len(prefix_ids_list))
-                mb_prefixes = prefix_ids_list[mb_start:mb_end]
+        try:
+            with param_ctx:
+                for mb_start in range(0, len(truncated_prefixes), micro_batch_size):
+                    mb_end = min(mb_start + micro_batch_size, len(truncated_prefixes))
+                    mb_prefixes = truncated_prefixes[mb_start:mb_end]
 
-                # Left-pad to longest prefix in this micro-batch
-                max_len = max(len(p) for p in mb_prefixes)
-                padded = torch.full(
-                    (len(mb_prefixes), max_len), pad_token_id,
-                    dtype=torch.long, device=device,
-                )
-                attn_mask = torch.zeros(
-                    (len(mb_prefixes), max_len), dtype=torch.long, device=device,
-                )
-                for j, prefix in enumerate(mb_prefixes):
-                    seq_len = len(prefix)
-                    padded[j, max_len - seq_len:] = torch.tensor(
-                        prefix, dtype=torch.long, device=device,
+                    # Left-pad to longest prefix in this micro-batch
+                    max_len = max(len(p) for p in mb_prefixes)
+                    padded = torch.full(
+                        (len(mb_prefixes), max_len), pad_token_id,
+                        dtype=torch.long, device=device,
                     )
-                    attn_mask[j, max_len - seq_len:] = 1
-
-                with torch.autocast(
-                    device_type=get_device_name(), dtype=torch.bfloat16
-                ):
-                    output = self.actor_module.generate(
-                        input_ids=padded,
-                        attention_mask=attn_mask,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        pad_token_id=pad_token_id,
-                        use_cache=True,
+                    attn_mask = torch.zeros(
+                        (len(mb_prefixes), max_len), dtype=torch.long, device=device,
                     )
+                    for j, prefix in enumerate(mb_prefixes):
+                        seq_len = len(prefix)
+                        padded[j, max_len - seq_len:] = torch.tensor(
+                            prefix, dtype=torch.long, device=device,
+                        )
+                        attn_mask[j, max_len - seq_len:] = 1
 
-                # Extract only the generated portion (everything after the prefix)
-                for j in range(len(mb_prefixes)):
-                    gen_ids = output[j, max_len:].cpu().tolist()
-                    # Trim trailing pad tokens
-                    while gen_ids and gen_ids[-1] == pad_token_id:
-                        gen_ids.pop()
-                    all_generated.append(gen_ids)
+                    with torch.autocast(
+                        device_type=get_device_name(), dtype=torch.bfloat16
+                    ):
+                        gen_out = self.actor_module.generate(
+                            input_ids=padded,
+                            attention_mask=attn_mask,
+                            max_new_tokens=max_new_tokens,
+                            do_sample=False,
+                            pad_token_id=pad_token_id,
+                            use_cache=True,
+                        )
 
-        output = DataProto()
-        output.non_tensor_batch = {
+                    # Extract only the generated portion (everything after the prefix)
+                    for j in range(len(mb_prefixes)):
+                        gen_ids = gen_out[j, max_len:].cpu().tolist()
+                        # Trim trailing pad tokens
+                        while gen_ids and gen_ids[-1] == pad_token_id:
+                            gen_ids.pop()
+                        all_generated.append(gen_ids)
+
+                    # Free micro-batch tensors before next iteration
+                    del padded, attn_mask, gen_out
+                    torch.cuda.empty_cache()
+        except torch.cuda.OutOfMemoryError as e:
+            logger.warning(
+                f"RWML predict_observations OOM after {len(all_generated)} "
+                f"of {len(truncated_prefixes)} prefixes: {e}. "
+                f"Returning empty predictions for remaining."
+            )
+            # Fill remaining with empty predictions so caller can still use results
+            while len(all_generated) < len(truncated_prefixes):
+                all_generated.append([])
+            torch.cuda.empty_cache()
+
+        result = DataProto()
+        result.non_tensor_batch = {
             "rwml_generated_ids": np.array(all_generated, dtype=object),
         }
-        return output
+        return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
