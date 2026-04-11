@@ -439,6 +439,26 @@ class DataParallelPPOActor(BasePPOActor):
             p[-max_prefix_len:] if len(p) > max_prefix_len else list(p)
             for p in prefix_ids_list
         ]
+        local_count = len(truncated_prefixes)
+
+        # ------------------------------------------------------------------
+        # Synchronize the number of micro-batches across all ranks.
+        # Different ranks can have different numbers of prefixes (depends on
+        # how many turns each sample in the shard has). Uneven work causes
+        # FSDP's per-forward all-gather calls to desync and eventually hits
+        # an NCCL watchdog timeout. We pad every rank to the same number of
+        # micro-batches using dummy prefixes, then discard dummy results.
+        # ------------------------------------------------------------------
+        local_num_mb = (local_count + micro_batch_size - 1) // micro_batch_size
+        if torch.distributed.is_initialized():
+            nm = torch.tensor([local_num_mb], device=device, dtype=torch.long)
+            torch.distributed.all_reduce(nm, op=torch.distributed.ReduceOp.MAX)
+            num_micro_batches = int(nm.item())
+        else:
+            num_micro_batches = local_num_mb
+
+        # Dummy prefix used to pad ranks with fewer real prefixes.
+        dummy_prefix = [pad_token_id, pad_token_id]
 
         # Free any cached GPU memory before generating
         gc.collect()
@@ -458,18 +478,29 @@ class DataParallelPPOActor(BasePPOActor):
 
         try:
             with param_ctx:
-                for mb_start in range(0, len(truncated_prefixes), micro_batch_size):
-                    mb_end = min(mb_start + micro_batch_size, len(truncated_prefixes))
-                    mb_prefixes = truncated_prefixes[mb_start:mb_end]
+                for mb_idx in range(num_micro_batches):
+                    mb_start = mb_idx * micro_batch_size
+                    mb_end = min(mb_start + micro_batch_size, local_count)
+
+                    # Build a micro-batch of size `micro_batch_size`, using
+                    # real prefixes where available and dummies otherwise.
+                    real_prefixes = (
+                        truncated_prefixes[mb_start:mb_end]
+                        if mb_start < local_count else []
+                    )
+                    num_real = len(real_prefixes)
+                    mb_prefixes = real_prefixes + [dummy_prefix] * (
+                        micro_batch_size - num_real
+                    )
 
                     # Left-pad to longest prefix in this micro-batch
                     max_len = max(len(p) for p in mb_prefixes)
                     padded = torch.full(
-                        (len(mb_prefixes), max_len), pad_token_id,
+                        (micro_batch_size, max_len), pad_token_id,
                         dtype=torch.long, device=device,
                     )
                     attn_mask = torch.zeros(
-                        (len(mb_prefixes), max_len), dtype=torch.long, device=device,
+                        (micro_batch_size, max_len), dtype=torch.long, device=device,
                     )
                     for j, prefix in enumerate(mb_prefixes):
                         seq_len = len(prefix)
@@ -481,19 +512,23 @@ class DataParallelPPOActor(BasePPOActor):
                     with torch.autocast(
                         device_type=get_device_name(), dtype=torch.bfloat16
                     ):
+                        # Force every generate() call to run exactly
+                        # max_new_tokens forward passes. Without this, early
+                        # EOS on one rank would produce a different number of
+                        # FSDP all-gathers than the other ranks → NCCL desync.
                         gen_out = self.actor_module.generate(
                             input_ids=padded,
                             attention_mask=attn_mask,
+                            min_new_tokens=max_new_tokens,
                             max_new_tokens=max_new_tokens,
                             do_sample=False,
                             pad_token_id=pad_token_id,
                             use_cache=True,
                         )
 
-                    # Extract only the generated portion (everything after the prefix)
-                    for j in range(len(mb_prefixes)):
+                    # Keep only results for real prefixes (discard dummies)
+                    for j in range(num_real):
                         gen_ids = gen_out[j, max_len:].cpu().tolist()
-                        # Trim trailing pad tokens
                         while gen_ids and gen_ids[-1] == pad_token_id:
                             gen_ids.pop()
                         all_generated.append(gen_ids)
@@ -504,11 +539,10 @@ class DataParallelPPOActor(BasePPOActor):
         except torch.cuda.OutOfMemoryError as e:
             logger.warning(
                 f"RWML predict_observations OOM after {len(all_generated)} "
-                f"of {len(truncated_prefixes)} prefixes: {e}. "
+                f"of {local_count} prefixes: {e}. "
                 f"Returning empty predictions for remaining."
             )
-            # Fill remaining with empty predictions so caller can still use results
-            while len(all_generated) < len(truncated_prefixes):
+            while len(all_generated) < local_count:
                 all_generated.append([])
             torch.cuda.empty_cache()
 
