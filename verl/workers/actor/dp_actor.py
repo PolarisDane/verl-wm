@@ -485,11 +485,11 @@ class DataParallelPPOActor(BasePPOActor):
                         gen_ids.pop()
                     all_generated.append(gen_ids)
 
-        return DataProto.from_dict(
-            non_tensor_batch={
-                "rwml_generated_ids": np.array(all_generated, dtype=object),
-            },
-        )
+        output = DataProto()
+        output.non_tensor_batch = {
+            "rwml_generated_ids": np.array(all_generated, dtype=object),
+        }
+        return output
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
